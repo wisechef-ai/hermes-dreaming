@@ -199,4 +199,8 @@ def build_provider(name: str, *, model: str | None = None, api_key: str | None =
         return OfflineMarkerProvider()
     if normalized in {"openai", "openai-compatible"}:
         return OpenAICompatibleProvider(model=model or "gpt-4o-mini", api_key=api_key, base_url=base_url)
+    if normalized in {"anthropic", "anthropic-oauth", "claude", "claude-max"}:
+        # Lazy import so the OpenAI provider path doesn't pull in Hermes deps.
+        from .anthropic_oauth_provider import AnthropicOAuthProvider, DEFAULT_MODEL
+        return AnthropicOAuthProvider(model=model or DEFAULT_MODEL)
     raise ValueError(f"unknown provider: {name}")

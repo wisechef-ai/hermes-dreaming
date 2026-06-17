@@ -50,6 +50,13 @@ class DreamProposal:
     proposed_text: str
     approved: bool
     notes: str | None = None
+    # Declared (not a runtime-only attribute) so it round-trips through
+    # asdict() into manifest.json + proposals.jsonl. Before this was a field,
+    # apply.py set ``proposal.applied = True`` as a dynamic attribute that
+    # asdict() silently dropped — so a partial apply left no per-proposal
+    # record on disk, and the review surface could not tell which proposals
+    # actually landed.
+    applied: bool = False
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> 'DreamProposal':
@@ -63,6 +70,7 @@ class DreamProposal:
             proposed_text=data.get('proposed_text', ''),
             approved=bool(data.get('approved', False)),
             notes=data.get('notes'),
+            applied=bool(data.get('applied', False)),
         )
 
 

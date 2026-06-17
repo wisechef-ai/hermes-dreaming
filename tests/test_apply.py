@@ -98,3 +98,99 @@ def test_discard_moves_artifact_to_archive_without_live_mutation(tmp_path: Path)
     assert not artifact_dir.exists()
     assert memory.read_text(encoding="utf-8") == "# MEMORY\n"
     assert load_artifact(discarded_path).status == "discarded"
+
+
+def _two_proposal_artifact(tmp_path: Path) -> Path:
+    """An artifact with one MEMORY and one USER proposal, both un-approved."""
+    live_root = tmp_path / "live"
+    live_root.mkdir()
+    (live_root / "MEMORY.md").write_text("seed mem\n", encoding="utf-8")
+    (live_root / "USER.md").write_text("seed user\n", encoding="utf-8")
+
+    mem = DreamProposal(
+        id="prop-memory",
+        target_kind="memory",
+        target_path="MEMORY.md",
+        mode="append_text",
+        summary="memory fact",
+        provenance=["sessions/1.md:1"],
+        proposed_text="A brand new memory fact about deployment topology.",
+        approved=False,
+    )
+    usr = DreamProposal(
+        id="prop-user",
+        target_kind="user",
+        target_path="USER.md",
+        mode="append_text",
+        summary="user pref",
+        provenance=["sessions/1.md:2"],
+        proposed_text="PREF a brand new user preference worth recording here.",
+        approved=False,
+    )
+    artifact = DreamArtifact(
+        artifact_id="artifact-partial",
+        created_at="2026-06-02T00:00:00Z",
+        provider="offline-marker",
+        status="validated",
+        workspace_root=str(live_root),
+        source_roots=[str(tmp_path / "sources")],
+        report="# Report",
+        sources=[],
+        proposals=[mem, usr],
+    )
+    artifact_dir = tmp_path / "artifact"
+    write_artifact(artifact, artifact_dir)
+    return artifact_dir
+
+
+def test_partial_apply_reports_partially_applied_and_persists_flags(tmp_path: Path) -> None:
+    """Approving ONLY the USER proposal must NOT stamp the artifact 'applied'.
+
+    Regression for the June-1 silent-partial-apply bug: status was
+    unconditionally set to 'applied' and the per-proposal 'applied' flag
+    was a runtime-only attribute dropped by asdict(), so the review surface
+    could not see that the MEMORY proposal never landed.
+    """
+    live_root = tmp_path / "live"
+    artifact_dir = _two_proposal_artifact(tmp_path)
+
+    result = apply_artifact(
+        artifact_dir,
+        live_root=live_root,
+        backup_root=tmp_path / "backups",
+        approve_ids=["prop-user"],
+    )
+
+    # Status reflects the gap, not a blanket "applied".
+    assert result.status == "partially_applied"
+
+    # The USER proposal landed; the MEMORY proposal did not.
+    assert "brand new user preference" in (live_root / "USER.md").read_text(encoding="utf-8")
+    assert "deployment topology" not in (live_root / "MEMORY.md").read_text(encoding="utf-8")
+
+    # Per-proposal flags persisted to disk (the asdict() round-trip fix).
+    reloaded = load_artifact(artifact_dir)
+    by_id = {p.id: p for p in reloaded.proposals}
+    assert by_id["prop-user"].applied is True
+    assert by_id["prop-memory"].applied is False
+    assert reloaded.status == "partially_applied"
+    assert reloaded.applied_at is not None
+
+
+def test_full_apply_reports_applied_and_flags_all(tmp_path: Path) -> None:
+    """Approving every proposal stamps 'applied' and flags both proposals."""
+    live_root = tmp_path / "live"
+    artifact_dir = _two_proposal_artifact(tmp_path)
+
+    result = apply_artifact(
+        artifact_dir,
+        live_root=live_root,
+        backup_root=tmp_path / "backups",
+        approve_all=True,
+    )
+
+    assert result.status == "applied"
+    reloaded = load_artifact(artifact_dir)
+    assert all(p.applied for p in reloaded.proposals)
+    assert reloaded.status == "applied"
+

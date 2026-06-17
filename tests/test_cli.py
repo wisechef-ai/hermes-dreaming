@@ -119,3 +119,42 @@ def test_discard_command_archives_artifact(tmp_path: Path, capsys) -> None:
     archived_dir = archive_root / artifact_dir.name
     assert archived_dir.exists()
     assert (live_root / "memory.md").read_text(encoding="utf-8") == "# MEMORY\n"
+
+
+def test_diff_resolves_bare_artifact_id(tmp_path: Path, capsys, monkeypatch) -> None:
+    """Regression: `diff <bare-id>` must resolve against the artifact root.
+
+    Previously a bare id (e.g. 20260617T...-140ac825) FileNotFound'd because it
+    resolved relative to cwd instead of HERMES_DREAMING_ARTIFACT_ROOT.
+    """
+    live_root = tmp_path / "live"
+    live_root.mkdir()
+    (live_root / "memory.md").write_text("# MEMORY\n", encoding="utf-8")
+    sources = _write_source_tree(tmp_path)
+    artifact_root = tmp_path / "artifacts"
+
+    assert (
+        main(
+            [
+                "create",
+                "--live-root",
+                str(live_root),
+                "--artifact-root",
+                str(artifact_root),
+                "--source",
+                str(sources),
+            ]
+        )
+        == 0
+    )
+    artifact_dir = Path(capsys.readouterr().out.strip().splitlines()[0].split(":", 1)[1].strip())
+    bare_id = artifact_dir.name
+
+    # Point the resolver's default root at our tmp artifact root, then run from
+    # an unrelated cwd so a relative-path interpretation would fail.
+    monkeypatch.setenv("HERMES_DREAMING_ARTIFACT_ROOT", str(artifact_root))
+    monkeypatch.chdir(tmp_path / "live")
+
+    assert main(["diff", bare_id]) == 0
+    diff_output = capsys.readouterr().out
+    assert "memory" in diff_output.lower()

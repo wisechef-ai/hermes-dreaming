@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import re
 import shutil
+from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 import tempfile
 
@@ -9,8 +11,75 @@ from .artifact import DreamArtifact, DreamProposal, load_artifact, write_artifac
 from .validation import validate_artifact
 
 
+def _utc_now_iso() -> str:
+    """UTC timestamp in the same ``…Z`` shape the artifact ids use."""
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
 class DreamApplyError(RuntimeError):
     pass
+
+
+# ---------------------------------------------------------------------------
+# Hermes memory_tool.py contract — kept in sync with hermes-agent/tools/
+# memory_tool.py::ENTRY_DELIMITER + MemoryStore char_limits + drift guard
+# (memory_tool.py::_detect_external_drift). Any change to that file's
+# constants requires updating this module.
+# ---------------------------------------------------------------------------
+HERMES_ENTRY_DELIMITER = "\n§\n"
+HERMES_MEMORY_MAX_PER_ENTRY = 2200  # MEMORY.md per-entry char cap (drift guard)
+HERMES_USER_MAX_PER_ENTRY = 1375    # USER.md per-entry char cap (drift guard)
+HERMES_MEMORY_TARGETS = {"MEMORY.md", "USER.md"}
+
+# dreamdedup_2805 (2026-05-28) — application-time near-duplicate gate.
+# The bundle builder's existing-state injection (Fix 1) and content-change
+# gate (Fix 2) catch most duplicates upstream; this is the belt-and-suspenders
+# net at apply time. A proposed memory entry is dropped if its token set is
+# >= DEDUP_JACCARD_THRESHOLD similar to ANY existing entry. Jaccard token-set
+# overlap (not raw substring) so "Cognee dataset is hermes-tori" and "the
+# Cognee default dataset: hermes-tori" collapse, while a genuinely new fact
+# that merely shares vocabulary with an existing one survives.
+DEDUP_JACCARD_THRESHOLD = 0.60
+# Entries shorter than this skip the fuzzy gate (still exact-match deduped) —
+# short entries have tiny token sets where Jaccard is noisy and a real new
+# fact can spuriously collide with an unrelated short existing entry.
+DEDUP_MIN_TOKENS = 6
+
+_TOKEN_RE = re.compile(r"[a-z0-9]+")
+
+
+def _tokenize(text: str) -> set[str]:
+    """Lowercased alphanumeric token set for Jaccard comparison.
+
+    Markdown punctuation, §-noise, and case are stripped so two phrasings of
+    the same fact map to near-identical token sets.
+    """
+    return set(_TOKEN_RE.findall(text.lower()))
+
+
+def _jaccard(a: set[str], b: set[str]) -> float:
+    if not a or not b:
+        return 0.0
+    inter = len(a & b)
+    if not inter:
+        return 0.0
+    return inter / len(a | b)
+
+
+def _is_near_duplicate(entry: str, existing_token_sets: list[set[str]]) -> bool:
+    """True if ``entry`` is a near-duplicate of any existing entry.
+
+    Short entries (< DEDUP_MIN_TOKENS tokens) are never fuzzy-matched here —
+    the caller still applies an exact-match check for those.
+    """
+    tokens = _tokenize(entry)
+    if len(tokens) < DEDUP_MIN_TOKENS:
+        return False
+    return any(
+        _jaccard(tokens, existing) >= DEDUP_JACCARD_THRESHOLD
+        for existing in existing_token_sets
+        if existing
+    )
 
 
 def _safe_relative_path(path_text: str) -> Path:
@@ -56,13 +125,131 @@ def _apply_append_text(current: str, addition: str) -> str:
     return current
 
 
+def _split_into_hermes_entries(addition: str, max_per_entry: int) -> list[str]:
+    """Split a multi-section markdown blob into Hermes-§-compatible entries.
+
+    Prefers ``## `` markdown headers as section boundaries. Falls back to
+    blank-line paragraph boundaries. Each emitted entry MUST be under
+    ``max_per_entry`` chars or the drift guard in hermes-agent's
+    memory_tool.py will refuse the next memory-tool write.
+    """
+    addition = addition.strip()
+    if not addition:
+        return []
+
+    # Cheap path: already small enough → single entry.
+    if len(addition) <= max_per_entry:
+        return [addition]
+
+    # Try to split on `## ` section headers first.
+    parts = re.split(r"\n(?=## )", addition)
+    parts = [p.strip() for p in parts if p.strip()]
+
+    # If we still have any oversize part, fall back to paragraph splits inside it.
+    expanded: list[str] = []
+    for p in parts:
+        if len(p) <= max_per_entry:
+            expanded.append(p)
+            continue
+        # Paragraph-level split (blank line separated).
+        paras = [pp.strip() for pp in re.split(r"\n\s*\n", p) if pp.strip()]
+        if not paras:
+            paras = [p]
+        # Try to keep the header on its own first entry if possible.
+        for para in paras:
+            if len(para) <= max_per_entry:
+                expanded.append(para)
+            else:
+                # Hard wrap on max_per_entry boundary (last resort — long
+                # contiguous paragraph). Prefer a sentence boundary.
+                remaining = para
+                while len(remaining) > max_per_entry:
+                    cut = remaining.rfind(". ", 0, max_per_entry)
+                    if cut < max_per_entry // 2:  # no good break — hard cut
+                        cut = max_per_entry
+                    else:
+                        cut += 1  # include the period
+                    expanded.append(remaining[:cut].strip())
+                    remaining = remaining[cut:].strip()
+                if remaining:
+                    expanded.append(remaining)
+    return expanded
+
+
+def _apply_hermes_memory_append(current: str, addition: str, max_per_entry: int) -> str:
+    """Append ``addition`` to a Hermes-format memory file (§-separated entries).
+
+    Splits the proposed text into entries that fit Hermes's drift guard,
+    deduplicates against existing entries, and joins with ``\\n§\\n``.
+    Output round-trips through ``hermes-agent/tools/memory_tool.py`` so the
+    next live ``memory(action=add)`` call doesn't trip the drift snapshot.
+    """
+    existing = [e.strip() for e in current.split(HERMES_ENTRY_DELIMITER) if e.strip()]
+    existing_token_sets = [_tokenize(e) for e in existing]
+    new_entries = _split_into_hermes_entries(addition, max_per_entry)
+    for entry in new_entries:
+        # Exact-match dedup (cheap, always on) + Jaccard near-duplicate gate
+        # (dreamdedup_2805). Skip entries already covered, verbatim or in
+        # substance, by an existing entry.
+        if entry in existing:
+            continue
+        if _is_near_duplicate(entry, existing_token_sets):
+            continue
+        existing.append(entry)
+        existing_token_sets.append(_tokenize(entry))
+    body = HERMES_ENTRY_DELIMITER.join(existing)
+    if not body.endswith("\n"):
+        body += "\n"
+    return body
+
+
+def _apply_hermes_facts_append(current: str, addition: str) -> str:
+    """Append a fact (JSONL row or rows) to MEMORY.md as ``[fact] ...`` entries.
+
+    Hermes's memory loader doesn't read ``facts.jsonl``. Routing fact-kind
+    proposals to MEMORY.md as plain-text entries (prefixed ``[fact]``) is
+    the only way they become visible to the running agent."""
+    rows: list[str] = []
+    for raw in addition.splitlines():
+        raw = raw.strip()
+        if not raw:
+            continue
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError:
+            # Treat as a plain-text fact if not parseable.
+            rows.append(f"[fact] {raw}")
+            continue
+        if isinstance(parsed, dict):
+            text = parsed.get("fact") or parsed.get("summary") or json.dumps(parsed, ensure_ascii=False)
+            rows.append(f"[fact] {text}")
+        else:
+            rows.append(f"[fact] {parsed}")
+
+    addition_as_text = HERMES_ENTRY_DELIMITER.join(rows)
+    return _apply_hermes_memory_append(current, addition_as_text, HERMES_MEMORY_MAX_PER_ENTRY)
+
+
 def _apply_jsonl_append(current: str, proposed_text: str) -> str:
-    proposed_text = proposed_text.strip()
-    line = json.dumps(json.loads(proposed_text), sort_keys=True, ensure_ascii=False)
-    lines = [row.rstrip("\n") for row in current.splitlines() if row.strip()]
-    if line not in lines:
-        lines.append(line)
-    return ("\n".join(lines) + "\n") if lines else (line + "\n")
+    """Append one or more JSON rows to a JSONL file.
+
+    proposed_text may be either a single JSON object, or multiple objects
+    one-per-non-empty-line. Each row is normalised (sort_keys, no whitespace
+    changes) and deduplicated against existing rows in the file."""
+    rows: list[str] = []
+    for raw in proposed_text.splitlines():
+        raw = raw.strip()
+        if not raw:
+            continue
+        rows.append(json.dumps(json.loads(raw), sort_keys=True, ensure_ascii=False))
+    if not rows:
+        rows.append(json.dumps(json.loads(proposed_text.strip()), sort_keys=True, ensure_ascii=False))
+
+    existing = [row.rstrip("\n") for row in current.splitlines() if row.strip()]
+    for row in rows:
+        if row not in existing:
+            existing.append(row)
+    return ("\n".join(existing) + "\n") if existing else ""
 
 
 def _apply_replace_text(proposed_text: str) -> str:
@@ -71,12 +258,30 @@ def _apply_replace_text(proposed_text: str) -> str:
 
 
 def _write_proposal(target: Path, proposal: DreamProposal) -> None:
+    target_name = target.name
+    current = target.read_text(encoding="utf-8") if target.exists() else ""
+
     if proposal.mode == "append_text":
-        current = target.read_text(encoding="utf-8") if target.exists() else ""
-        updated = _apply_append_text(current, proposal.proposed_text)
+        # If we're writing to a Hermes-format memory file, use §-aware append
+        # so the result round-trips through hermes-agent's memory_tool.
+        if target_name in HERMES_MEMORY_TARGETS:
+            cap = HERMES_USER_MAX_PER_ENTRY if target_name == "USER.md" else HERMES_MEMORY_MAX_PER_ENTRY
+            updated = _apply_hermes_memory_append(current, proposal.proposed_text, cap)
+        else:
+            updated = _apply_append_text(current, proposal.proposed_text)
     elif proposal.mode == "jsonl_append":
-        current = target.read_text(encoding="utf-8") if target.exists() else ""
-        updated = _apply_jsonl_append(current, proposal.proposed_text)
+        # fact-kind proposals targeting Hermes's facts.jsonl are inert (the
+        # agent doesn't read facts.jsonl). Route them to MEMORY.md as
+        # ``[fact] ...`` §-entries so they actually load.
+        if proposal.target_kind == "fact" and target_name == "facts.jsonl":
+            mem_path = target.parent / "MEMORY.md"
+            mem_current = mem_path.read_text(encoding="utf-8") if mem_path.exists() else ""
+            mem_updated = _apply_hermes_facts_append(mem_current, proposal.proposed_text)
+            atomic_write_text(mem_path, mem_updated)
+            # Also keep the raw .jsonl as an audit log alongside MEMORY.md.
+            updated = _apply_jsonl_append(current, proposal.proposed_text)
+        else:
+            updated = _apply_jsonl_append(current, proposal.proposed_text)
     elif proposal.mode == "replace_text":
         updated = _apply_replace_text(proposal.proposed_text)
     else:  # pragma: no cover - guarded by validation
@@ -86,9 +291,43 @@ def _write_proposal(target: Path, proposal: DreamProposal) -> None:
 
     verify_text = target.read_text(encoding="utf-8")
     if proposal.mode == "jsonl_append":
-        expected_line = json.dumps(json.loads(proposal.proposed_text), sort_keys=True, ensure_ascii=False)
-        if expected_line not in verify_text:
-            raise DreamApplyError(f"verification failed after writing {target}")
+        # Every emitted row should be present after the write. Tolerate
+        # multi-row payloads (one JSON object per line in proposed_text).
+        for raw in proposal.proposed_text.splitlines():
+            raw = raw.strip()
+            if not raw:
+                continue
+            expected = json.dumps(json.loads(raw), sort_keys=True, ensure_ascii=False)
+            if expected not in verify_text:
+                raise DreamApplyError(f"verification failed after writing {target}")
+    elif target_name in HERMES_MEMORY_TARGETS:
+        # For Hermes-format files, verify by checking the entry round-trips.
+        # The original block was split into §-entries; verify any one of
+        # them lands. Use the first non-blank line as a unique marker.
+        #
+        # dreamdedup_2805: the §-append may legitimately DROP an entry as an
+        # exact or near-duplicate (its content is already stored). In that
+        # case the first line won't appear verbatim — that's success, not
+        # failure. Treat "already represented in substance" as verified.
+        first_line = next(
+            (l.strip() for l in proposal.proposed_text.splitlines() if l.strip()),
+            None,
+        )
+        if first_line and first_line not in verify_text:
+            existing_after = [
+                e.strip() for e in verify_text.split(HERMES_ENTRY_DELIMITER) if e.strip()
+            ]
+            existing_token_sets = [_tokenize(e) for e in existing_after]
+            proposed_entries = _split_into_hermes_entries(
+                proposal.proposed_text,
+                HERMES_USER_MAX_PER_ENTRY if target_name == "USER.md" else HERMES_MEMORY_MAX_PER_ENTRY,
+            )
+            all_accounted = all(
+                (entry in existing_after) or _is_near_duplicate(entry, existing_token_sets)
+                for entry in proposed_entries
+            )
+            if not (proposed_entries and all_accounted):
+                raise DreamApplyError(f"verification failed after writing {target}")
     elif proposal.proposed_text.strip() and proposal.proposed_text.strip() not in verify_text:
         raise DreamApplyError(f"verification failed after writing {target}")
 
@@ -129,7 +368,15 @@ def apply_artifact(
         _write_proposal(target, proposal)
         proposal.applied = True
 
-    artifact.status = "applied"
+    # Status must reflect what ACTUALLY landed, not a blanket assumption.
+    # A selective apply (e.g. approve only USER.md) used to stamp the whole
+    # artifact "applied", masking the un-applied proposals — the review
+    # surface then trusted the stamp and assumed every proposal landed.
+    # Now: "applied" only when every proposal in the artifact was applied;
+    # "partially_applied" when some remain un-applied so the gap is visible.
+    all_applied = all(p.applied for p in artifact.proposals)
+    artifact.status = "applied" if all_applied else "partially_applied"
+    artifact.applied_at = _utc_now_iso()
     artifact.validation_errors = []
     write_artifact(artifact, artifact_dir)
     return artifact
