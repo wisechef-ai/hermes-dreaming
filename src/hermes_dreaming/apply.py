@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import re
 import shutil
+import sys
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 import tempfile
@@ -30,6 +31,19 @@ HERMES_ENTRY_DELIMITER = "\n§\n"
 HERMES_MEMORY_MAX_PER_ENTRY = 2200  # MEMORY.md per-entry char cap (drift guard)
 HERMES_USER_MAX_PER_ENTRY = 1375    # USER.md per-entry char cap (drift guard)
 HERMES_MEMORY_TARGETS = {"MEMORY.md", "USER.md"}
+
+# Option-2 re-plumb (2026-07-14) — WHOLE-FILE injection budgets. The per-entry
+# drift caps above are not the binding constraint: hermes-agent injects at most
+# ~memory_char_limit chars of each file into the system prompt. Anything past
+# that is written-but-never-seen ("dark memory"). The headroom gate below
+# refuses to push a file past its budget; overflow entries divert to Cognee
+# (Layer 2 — unbounded, auto-recalled per turn by the memory-router hook).
+HERMES_MEMORY_FILE_BUDGET = 2200
+HERMES_USER_FILE_BUDGET = 1375
+HERMES_FILE_BUDGETS = {
+    "MEMORY.md": HERMES_MEMORY_FILE_BUDGET,
+    "USER.md": HERMES_USER_FILE_BUDGET,
+}
 
 # dreamdedup_2805 (2026-05-28) — application-time near-duplicate gate.
 # The bundle builder's existing-state injection (Fix 1) and content-change
@@ -203,6 +217,61 @@ def _apply_hermes_memory_append(current: str, addition: str, max_per_entry: int)
     return body
 
 
+def _apply_hermes_memory_append_budgeted(
+    current: str,
+    addition: str,
+    max_per_entry: int,
+    file_budget: int,
+) -> tuple[str, list[str], list[str]]:
+    """Budget-aware §-append. Returns (updated_text, applied, diverted).
+
+    Same dedup semantics as ``_apply_hermes_memory_append``, plus a
+    WHOLE-FILE headroom gate: an entry only lands in the file if the
+    resulting file stays within ``file_budget`` chars (the injection
+    window). Entries that don't fit are returned in ``diverted`` for the
+    caller to route to Cognee — never silently dropped, never written
+    into the dark zone past the budget.
+    """
+    existing = [e.strip() for e in current.split(HERMES_ENTRY_DELIMITER) if e.strip()]
+    existing_token_sets = [_tokenize(e) for e in existing]
+    new_entries = _split_into_hermes_entries(addition, max_per_entry)
+    applied: list[str] = []
+    diverted: list[str] = []
+    for entry in new_entries:
+        if entry in existing:
+            continue
+        if _is_near_duplicate(entry, existing_token_sets):
+            continue
+        candidate = existing + [entry]
+        candidate_len = len(HERMES_ENTRY_DELIMITER.join(candidate)) + 1  # trailing \n
+        if candidate_len > file_budget:
+            diverted.append(entry)
+            continue
+        existing.append(entry)
+        existing_token_sets.append(_tokenize(entry))
+        applied.append(entry)
+    body = HERMES_ENTRY_DELIMITER.join(existing)
+    if not body.endswith("\n"):
+        body += "\n"
+    return body, applied, diverted
+
+
+def _divert_to_cognee(entries: list[str], *, kind: str, provenance: str = "") -> list[dict]:
+    """Route overflow/fact entries to the Layer-2 Cognee brain.
+
+    Import is lazy + guarded so apply never hard-fails on a missing or
+    broken sink — cognee_client spools to disk when Cognee is down.
+    """
+    results: list[dict] = []
+    try:
+        from .cognee_client import send_fact
+    except Exception as exc:  # pragma: no cover — packaging error
+        return [{"sent": False, "error": f"cognee_client import failed: {exc}"}]
+    for entry in entries:
+        results.append(send_fact(entry, kind=kind, provenance=provenance))
+    return results
+
+
 def _apply_hermes_facts_append(current: str, addition: str) -> str:
     """Append a fact (JSONL row or rows) to MEMORY.md as ``[fact] ...`` entries.
 
@@ -260,25 +329,64 @@ def _apply_replace_text(proposed_text: str) -> str:
 def _write_proposal(target: Path, proposal: DreamProposal) -> None:
     target_name = target.name
     current = target.read_text(encoding="utf-8") if target.exists() else ""
+    provenance = "; ".join(proposal.provenance) if getattr(proposal, "provenance", None) else ""
 
     if proposal.mode == "append_text":
-        # If we're writing to a Hermes-format memory file, use §-aware append
-        # so the result round-trips through hermes-agent's memory_tool.
+        # If we're writing to a Hermes-format memory file, use the
+        # budget-aware §-append (Option-2 re-plumb 2026-07-14): entries land
+        # in the file only while it stays inside the injection window;
+        # overflow diverts to Cognee instead of the dark zone.
         if target_name in HERMES_MEMORY_TARGETS:
             cap = HERMES_USER_MAX_PER_ENTRY if target_name == "USER.md" else HERMES_MEMORY_MAX_PER_ENTRY
-            updated = _apply_hermes_memory_append(current, proposal.proposed_text, cap)
+            budget = HERMES_FILE_BUDGETS[target_name]
+            updated, applied, diverted = _apply_hermes_memory_append_budgeted(
+                current, proposal.proposed_text, cap, budget
+            )
+            if diverted:
+                results = _divert_to_cognee(
+                    diverted,
+                    kind=f"{proposal.target_kind or 'memory'}-overflow",
+                    provenance=provenance,
+                )
+                for entry, res in zip(diverted, results):
+                    dest = "cognee" if res.get("sent") else res.get("spooled", "LOST")
+                    print(
+                        f"[dreaming-apply] {target_name} over budget "
+                        f"({budget}c) — diverted {len(entry)}c entry -> {dest}",
+                        file=sys.stderr,
+                    )
         else:
             updated = _apply_append_text(current, proposal.proposed_text)
     elif proposal.mode == "jsonl_append":
-        # fact-kind proposals targeting Hermes's facts.jsonl are inert (the
-        # agent doesn't read facts.jsonl). Route them to MEMORY.md as
-        # ``[fact] ...`` §-entries so they actually load.
+        # Option-2 re-plumb: fact-kind proposals are Layer-2 data. They go
+        # to Cognee (unbounded, auto-recalled per turn) — NOT to MEMORY.md,
+        # which is reserved for guardrails/IDs under the injection budget.
+        # facts.jsonl still gets the raw rows as a local audit log.
         if proposal.target_kind == "fact" and target_name == "facts.jsonl":
-            mem_path = target.parent / "MEMORY.md"
-            mem_current = mem_path.read_text(encoding="utf-8") if mem_path.exists() else ""
-            mem_updated = _apply_hermes_facts_append(mem_current, proposal.proposed_text)
-            atomic_write_text(mem_path, mem_updated)
-            # Also keep the raw .jsonl as an audit log alongside MEMORY.md.
+            fact_entries: list[str] = []
+            for raw in proposal.proposed_text.splitlines():
+                raw = raw.strip()
+                if not raw:
+                    continue
+                try:
+                    parsed = json.loads(raw)
+                    if isinstance(parsed, dict):
+                        fact_entries.append(
+                            str(parsed.get("fact") or parsed.get("summary")
+                                or json.dumps(parsed, ensure_ascii=False))
+                        )
+                    else:
+                        fact_entries.append(str(parsed))
+                except json.JSONDecodeError:
+                    fact_entries.append(raw)
+            results = _divert_to_cognee(fact_entries, kind="fact", provenance=provenance)
+            sent = sum(1 for r in results if r.get("sent"))
+            spooled = sum(1 for r in results if r.get("spooled"))
+            print(
+                f"[dreaming-apply] fact-kind -> Cognee: {sent} sent, "
+                f"{spooled} spooled (of {len(fact_entries)})",
+                file=sys.stderr,
+            )
             updated = _apply_jsonl_append(current, proposal.proposed_text)
         else:
             updated = _apply_jsonl_append(current, proposal.proposed_text)
@@ -309,6 +417,10 @@ def _write_proposal(target: Path, proposal: DreamProposal) -> None:
         # exact or near-duplicate (its content is already stored). In that
         # case the first line won't appear verbatim — that's success, not
         # failure. Treat "already represented in substance" as verified.
+        # Option-2 re-plumb: a budget-DIVERTED entry also won't appear in
+        # the file — it went to Cognee/spool instead. That is success too:
+        # verify each proposed entry is present, near-duplicate, OR would
+        # not fit the file budget (i.e. was legitimately diverted).
         first_line = next(
             (l.strip() for l in proposal.proposed_text.splitlines() if l.strip()),
             None,
@@ -318,12 +430,16 @@ def _write_proposal(target: Path, proposal: DreamProposal) -> None:
                 e.strip() for e in verify_text.split(HERMES_ENTRY_DELIMITER) if e.strip()
             ]
             existing_token_sets = [_tokenize(e) for e in existing_after]
+            file_budget = HERMES_FILE_BUDGETS[target_name]
+            current_len = len(verify_text)
             proposed_entries = _split_into_hermes_entries(
                 proposal.proposed_text,
                 HERMES_USER_MAX_PER_ENTRY if target_name == "USER.md" else HERMES_MEMORY_MAX_PER_ENTRY,
             )
             all_accounted = all(
-                (entry in existing_after) or _is_near_duplicate(entry, existing_token_sets)
+                (entry in existing_after)
+                or _is_near_duplicate(entry, existing_token_sets)
+                or (current_len + len(HERMES_ENTRY_DELIMITER) + len(entry) > file_budget)
                 for entry in proposed_entries
             )
             if not (proposed_entries and all_accounted):

@@ -348,7 +348,39 @@ class AnthropicOAuthProvider:
                     file=sys.stderr,
                 )
 
-        response = client.messages.create(**kwargs)
+        # Retry ladder for transient API failures (added 2026-07-14 after a
+        # naked 529 Overloaded killed the 03:45 nightly run with zero retry).
+        # 529/429/5xx are transient by definition — a years-scale pipeline
+        # never makes a single naked network call. 4 attempts, exponential
+        # backoff 30s/60s/120s (nightly cron has no latency budget).
+        import anthropic as _anthropic
+        import time as _time
+
+        _RETRYABLE = (
+            _anthropic.APIStatusError,
+            _anthropic.APIConnectionError,
+            _anthropic.APITimeoutError,
+        )
+        max_attempts = 4
+        response = None
+        for attempt in range(1, max_attempts + 1):
+            try:
+                response = client.messages.create(**kwargs)
+                break
+            except _RETRYABLE as exc:
+                status = getattr(exc, "status_code", None)
+                transient = status is None or status in (429, 500, 502, 503, 529)
+                if not transient or attempt == max_attempts:
+                    raise
+                delay = 30 * (2 ** (attempt - 1))
+                print(
+                    f"[anthropic-oauth-provider] transient API error "
+                    f"(status={status}, attempt {attempt}/{max_attempts}) — "
+                    f"retrying in {delay}s: {exc!r}",
+                    file=sys.stderr,
+                )
+                _time.sleep(delay)
+        assert response is not None  # loop either broke or raised
 
         # Pull the text out of the Anthropic response.
         text_parts: list[str] = []
