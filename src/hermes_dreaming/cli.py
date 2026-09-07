@@ -39,6 +39,65 @@ from .state import record_run
 from .validation import validate_artifact
 
 
+
+# Defaults are environment-aware so running `hermes dreaming status` from
+# any cwd uses the same paths as the cron driver. Set HERMES_DREAMING_HOME
+# to override the root; individual roots can be overridden too.
+def _dreaming_home() -> Path:
+    env = os.environ.get("HERMES_DREAMING_HOME")
+    if env:
+        return Path(env).expanduser()
+    return Path.home() / ".hermes" / "dreaming"
+
+
+def _default_live_root() -> Path:
+    env = os.environ.get("HERMES_DREAMING_LIVE_ROOT")
+    if env:
+        return Path(env).expanduser()
+    return Path.home() / ".hermes" / "memories"
+
+
+def _default(name: str, fallback: Path) -> Path:
+    env = os.environ.get(name)
+    if env:
+        return Path(env).expanduser()
+    return fallback
+
+
+def _resolve_paths() -> dict[str, Path]:
+    home = _dreaming_home()
+    return {
+        "live_root":     _default_live_root(),
+        "artifact_root": _default("HERMES_DREAMING_ARTIFACT_ROOT", home / "artifacts"),
+        "source":        _default("HERMES_DREAMING_SOURCE",        home / "sources"),
+        "backup_root":   _default("HERMES_DREAMING_BACKUP_ROOT",   home / "backups"),
+        "archive_root":  _default("HERMES_DREAMING_ARCHIVE_ROOT",  home / "archive"),
+    }
+
+
+def _resolve_artifact_dir(raw: Path) -> Path:
+    """Resolve an artifact argument that may be a full path OR a bare artifact id.
+
+    The cron driver and morning brief refer to artifacts by their bare id
+    (e.g. ``20260617T014529Z-140ac825``). Passing that to ``diff``/``validate``/
+    ``apply``/``discard`` used to FileNotFound because the id resolved relative
+    to cwd. We now fall back to ``<artifact_root>/<id>`` when the literal path
+    has no manifest of its own.
+    """
+    raw = Path(raw)
+    manifest = "manifest.json"
+    # A directory that already contains the manifest is used as-is (covers
+    # absolute paths and correct relative paths — preserves prior behaviour).
+    if (raw / manifest).is_file():
+        return raw
+    # Otherwise treat the argument as a bare id under the configured root.
+    candidate = _resolve_paths()["artifact_root"] / raw.name
+    if (candidate / manifest).is_file():
+        return candidate
+    # Nothing matched — return the original so the downstream loader raises a
+    # clear FileNotFoundError naming the path the user actually passed.
+    return raw
+
 def _discover_update_repo_root() -> Path:
     env_root = os.environ.get("HERMES_DREAMING_REPO_ROOT")
     if env_root:
@@ -459,15 +518,15 @@ def main(argv: list[str] | None = None) -> int:
         return _run_creation_like("review", args, dry_run=True, parser=parser)
 
     if args.command == "summarize":
-        artifact = load_artifact(args.artifact)
-        output = render_summary(args.artifact)
+        artifact = load_artifact(_resolve_artifact_dir(args.artifact))
+        output = render_summary(_resolve_artifact_dir(args.artifact))
         print(output.rstrip())
         _record_cli_run(
             "summarize",
             success=True,
             artifact_id=artifact.artifact_id,
             artifact_status=artifact.status,
-            artifact_dir=args.artifact,
+            artifact_dir=_resolve_artifact_dir(args.artifact),
             live_root=Path(artifact.workspace_root),
             summary=f"summarized artifact {artifact.artifact_id}",
         )
@@ -475,13 +534,13 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "approve":
         try:
-            result = approve_artifact(args.artifact, args.proposal)
+            result = approve_artifact(_resolve_artifact_dir(args.artifact), args.proposal)
         except ReviewError as exc:
             print(str(exc))
             _record_cli_run(
                 "approve",
                 success=False,
-                artifact_dir=args.artifact,
+                artifact_dir=_resolve_artifact_dir(args.artifact),
                 summary=str(exc),
             )
             return 1
@@ -495,7 +554,7 @@ def main(argv: list[str] | None = None) -> int:
             success=True,
             artifact_id=artifact.artifact_id,
             artifact_status=artifact.status,
-            artifact_dir=args.artifact,
+            artifact_dir=_resolve_artifact_dir(args.artifact),
             live_root=Path(artifact.workspace_root),
             summary=f"approved {result.changed} proposal(s)",
         )
@@ -503,13 +562,13 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "reject":
         try:
-            result = reject_artifact(args.artifact, args.proposal, reason=args.reason)
+            result = reject_artifact(_resolve_artifact_dir(args.artifact), args.proposal, reason=args.reason)
         except ReviewError as exc:
             print(str(exc))
             _record_cli_run(
                 "reject",
                 success=False,
-                artifact_dir=args.artifact,
+                artifact_dir=_resolve_artifact_dir(args.artifact),
                 summary=str(exc),
             )
             return 1
@@ -523,28 +582,28 @@ def main(argv: list[str] | None = None) -> int:
             success=True,
             artifact_id=artifact.artifact_id,
             artifact_status=artifact.status,
-            artifact_dir=args.artifact,
+            artifact_dir=_resolve_artifact_dir(args.artifact),
             live_root=Path(artifact.workspace_root),
             summary=f"rejected {result.changed} proposal(s)",
         )
         return 0
 
     if args.command == "diff":
-        artifact = load_artifact(args.artifact)
+        artifact = load_artifact(_resolve_artifact_dir(args.artifact))
         print(render_artifact_diff(artifact, live_root=args.live_root).rstrip())
         _record_cli_run(
             "diff",
             success=True,
             artifact_id=artifact.artifact_id,
             artifact_status=artifact.status,
-            artifact_dir=args.artifact,
+            artifact_dir=_resolve_artifact_dir(args.artifact),
             live_root=args.live_root,
             summary=f"inspected artifact {artifact.artifact_id}",
         )
         return 0
 
     if args.command == "validate":
-        artifact = load_artifact(args.artifact)
+        artifact = load_artifact(_resolve_artifact_dir(args.artifact))
         errors = validate_artifact(artifact, live_root=args.live_root)
         if errors:
             print("artifact is invalid")
@@ -555,7 +614,7 @@ def main(argv: list[str] | None = None) -> int:
                 success=False,
                 artifact_id=artifact.artifact_id,
                 artifact_status=artifact.status,
-                artifact_dir=args.artifact,
+                artifact_dir=_resolve_artifact_dir(args.artifact),
                 live_root=args.live_root,
                 summary="artifact is invalid",
                 errors=errors,
@@ -567,7 +626,7 @@ def main(argv: list[str] | None = None) -> int:
             success=True,
             artifact_id=artifact.artifact_id,
             artifact_status=artifact.status,
-            artifact_dir=args.artifact,
+            artifact_dir=_resolve_artifact_dir(args.artifact),
             live_root=args.live_root,
             summary="artifact is valid",
         )
@@ -576,7 +635,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "apply":
         approve_all = any(item.lower() in {"all", "*", "true", "yes"} for item in args.approve)
         approve_ids = [item for item in args.approve if item.lower() not in {"all", "*", "true", "yes"}]
-        artifact = load_artifact(args.artifact)
+        artifact = load_artifact(_resolve_artifact_dir(args.artifact))
         priority_filter = None
         target_kind_filter = None
         try:
@@ -589,14 +648,14 @@ def main(argv: list[str] | None = None) -> int:
                 success=False,
                 artifact_id=artifact.artifact_id,
                 artifact_status=artifact.status,
-                artifact_dir=args.artifact,
+                artifact_dir=_resolve_artifact_dir(args.artifact),
                 live_root=args.live_root,
                 summary=str(exc),
             )
             return 1
         try:
             applied = apply_artifact(
-                args.artifact,
+                _resolve_artifact_dir(args.artifact),
                 live_root=args.live_root,
                 backup_root=args.backup_root,
                 approve_all=approve_all,
@@ -612,7 +671,7 @@ def main(argv: list[str] | None = None) -> int:
                 success=False,
                 artifact_id=artifact.artifact_id,
                 artifact_status=artifact.status,
-                artifact_dir=args.artifact,
+                artifact_dir=_resolve_artifact_dir(args.artifact),
                 live_root=args.live_root,
                 summary=str(exc),
             )
@@ -634,7 +693,7 @@ def main(argv: list[str] | None = None) -> int:
                 success=True,
                 artifact_id=applied.artifact_id,
                 artifact_status=applied.status,
-                artifact_dir=args.artifact,
+                artifact_dir=_resolve_artifact_dir(args.artifact),
                 live_root=args.live_root,
                 summary="dry-run preview",
             )
@@ -646,7 +705,7 @@ def main(argv: list[str] | None = None) -> int:
             success=True,
             artifact_id=applied.artifact_id,
             artifact_status=applied.status,
-            artifact_dir=args.artifact,
+            artifact_dir=_resolve_artifact_dir(args.artifact),
             live_root=args.live_root,
             summary=f"applied artifact {applied.artifact_id}",
         )
@@ -655,7 +714,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "revert":
         try:
             reverted = revert_artifact(
-                args.artifact,
+                _resolve_artifact_dir(args.artifact),
                 live_root=args.live_root,
                 backup_root=args.backup_root,
                 yes=args.yes,
@@ -672,7 +731,7 @@ def main(argv: list[str] | None = None) -> int:
             _record_cli_run(
                 "revert",
                 success=False,
-                artifact_dir=args.artifact,
+                artifact_dir=_resolve_artifact_dir(args.artifact),
                 summary=message.splitlines()[0] if message else "revert failed",
             )
             return 1
@@ -684,21 +743,21 @@ def main(argv: list[str] | None = None) -> int:
             success=True,
             artifact_id=reverted.artifact_id,
             artifact_status=reverted.status,
-            artifact_dir=args.artifact,
+            artifact_dir=_resolve_artifact_dir(args.artifact),
             summary=f"reverted artifact {reverted.artifact_id}",
         )
         return 0
 
     if args.command == "discard":
-        artifact = load_artifact(args.artifact)
-        archived = discard_artifact(args.artifact, archive_root=args.archive_root)
+        artifact = load_artifact(_resolve_artifact_dir(args.artifact))
+        archived = discard_artifact(_resolve_artifact_dir(args.artifact), archive_root=args.archive_root)
         print(f"discarded artifact: {archived}")
         _record_cli_run(
             "discard",
             success=True,
             artifact_id=artifact.artifact_id,
             artifact_status=artifact.status,
-            artifact_dir=args.artifact,
+            artifact_dir=_resolve_artifact_dir(args.artifact),
             summary=f"discarded artifact {artifact.artifact_id}",
         )
         return 0
@@ -750,10 +809,10 @@ def main(argv: list[str] | None = None) -> int:
                 summary=f"rendered inbox digest with {inbox_digest.active_artifacts} active artifact(s)",
             )
             return 0
-        if args.artifact is None:
+        if _resolve_artifact_dir(args.artifact) is None:
             parser.error("digest requires an artifact unless --inbox is set")
         digest = build_digest(
-            args.artifact,
+            _resolve_artifact_dir(args.artifact),
             artifact_root=args.artifact_root,
             state_root=args.state_root,
             include_weekly=args.weekly,
@@ -764,7 +823,7 @@ def main(argv: list[str] | None = None) -> int:
             success=True,
             artifact_id=digest.artifact.artifact_id,
             artifact_status=digest.artifact.status,
-            artifact_dir=args.artifact,
+            artifact_dir=_resolve_artifact_dir(args.artifact),
             artifact_root=args.artifact_root,
             live_root=Path(digest.artifact.workspace_root),
             summary=f"rendered digest for {digest.artifact.artifact_id}",
@@ -777,7 +836,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.command == "report-card":
-        report_card = report_card_command(args.artifact)
+        report_card = report_card_command(_resolve_artifact_dir(args.artifact))
         markdown = render_report_card_markdown(report_card)
         if args.output is not None:
             args.output.parent.mkdir(parents=True, exist_ok=True)
@@ -792,7 +851,7 @@ def main(argv: list[str] | None = None) -> int:
             success=True,
             artifact_id=report_card.artifact_id,
             artifact_status=report_card.status,
-            artifact_dir=args.artifact,
+            artifact_dir=_resolve_artifact_dir(args.artifact),
             summary=f"rendered redacted report card for {report_card.artifact_id}",
         )
         return 0

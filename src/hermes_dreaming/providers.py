@@ -320,11 +320,36 @@ class OpenAICompatibleProvider:
             for item in proposals_value
         ]
         proposals = self._dedupe_proposals(proposals, payload_hash=payload_hash)
+        # Fail-partial, not fail-closed: a single policy-invalid proposal (e.g. a
+        # 5-line memory bullet) must not void the 8 good ones beside it. Drop the
+        # offenders per-proposal, keep the rest, and surface each drop as a note.
+        # Whole-batch errors (nothing salvageable) still raise as before.
+        proposals, dropped = self._drop_policy_invalid(proposals)
         validation_errors = validate_proposals(proposals)
         if validation_errors:
             raise ProviderOutputError(self.name, "; ".join(validation_errors), payload_hash=payload_hash)
         notes = self._normalize_notes(payload.get("notes", []))
+        notes.extend(f"dropped {pid}: {why}" for pid, why in dropped)
         return report, proposals, notes
+
+    @staticmethod
+    def _drop_policy_invalid(proposals: list[DreamProposal]) -> tuple[list[DreamProposal], list[tuple[str, str]]]:
+        """Split proposals into (kept, [(id, reason), ...]) using per-proposal policy only."""
+        from .policy import evaluate_proposal
+        from .validation import _proposal_errors
+
+        kept: list[DreamProposal] = []
+        dropped: list[tuple[str, str]] = []
+        for proposal in proposals:
+            errs = _proposal_errors(proposal)
+            decision = evaluate_proposal(proposal)
+            if not decision.ok:
+                errs.append(decision.error or "policy rejected")
+            if errs:
+                dropped.append((proposal.id, "; ".join(errs)))
+            else:
+                kept.append(proposal)
+        return kept, dropped
 
     def _normalize_notes(self, value: object) -> list[str]:
         if value is None:
@@ -493,9 +518,17 @@ class OpenAICompatibleProvider:
         deduped: list[DreamProposal] = []
         by_target: dict[str, DreamProposal] = {}
         for proposal in sorted(proposals, key=lambda item: (item.target_kind, item.target_path, item.mode, item.id)):
-            existing = by_target.get(proposal.target_path)
+            # jsonl_append rows are one JSON object each (validation + apply both
+            # assume that), so distinct facts to facts.jsonl are distinct proposals,
+            # not a conflict — key them by payload. Identical rows still collapse.
+            dedupe_key = (
+                f"{proposal.target_path}\x00{proposal.proposed_text.strip()}"
+                if proposal.mode == "jsonl_append"
+                else proposal.target_path
+            )
+            existing = by_target.get(dedupe_key)
             if existing is None:
-                by_target[proposal.target_path] = proposal
+                by_target[dedupe_key] = proposal
                 deduped.append(proposal)
                 continue
 
@@ -639,6 +672,10 @@ def build_provider(name: str, *, model: str | None = None, api_key: str | None =
         return OpenAICompatibleProvider(model=model or "gpt-4o-mini", api_key=api_key, base_url=base_url)
     if normalized in {"ollama", "ollama-native"}:
         return OllamaProvider(model=model or "qwen2.5:3b", api_key=api_key, base_url=base_url or "http://127.0.0.1:11434")
+    if normalized in {"anthropic", "anthropic-oauth", "claude"}:
+        # Tori fork: Claude Max OAuth path via hermes-agent's adapter (no API key).
+        from .anthropic_oauth_provider import AnthropicOAuthProvider
+        return AnthropicOAuthProvider(model=model) if model else AnthropicOAuthProvider()
     raise ValueError(f"unknown provider: {name}")
 
 
@@ -684,6 +721,12 @@ def list_providers() -> list[ProviderInfo]:
             kind="ollama",
             status="optional",
             notes="requires local Ollama server and qwen2.5:3b (or override --model)",
+        ),
+        ProviderInfo(
+            name="anthropic",
+            kind="anthropic_oauth",
+            status="optional",
+            notes="Tori fork: Claude Max OAuth via hermes-agent adapter; no API key (aliases: anthropic-oauth, claude)",
         ),
     ]
     return rows

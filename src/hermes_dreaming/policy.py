@@ -122,14 +122,76 @@ def fingerprint_provenance(provenance: Iterable[str]) -> str:
     return "|".join(cleaned) if cleaned else "-"
 
 
+# dreamescape_0824 (2026-08-24) — Opus over-escaping fallback.
+# ---------------------------------------------------------------------------
+# Over-fit 3 (see references/upstream-validator-overfits.md) taught the
+# validator to walk proposed_text `.splitlines()` and parse each non-empty
+# line as one JSON object — correct when the model joins rows with a REAL
+# newline byte (0x0A). Observed 2026-08-24: Opus double-escaped the row
+# separator inside the outer envelope JSON, emitting the *literal two-char
+# text* `\n` (backslash + 'n') between rows instead of an actual newline.
+# `.splitlines()` doesn't split on that, so N rows arrive concatenated on
+# one "line" and `json.loads` fails with "Extra data" at the second object's
+# start — the whole artifact gets marked invalid and a day of dreaming is
+# lost, even though every individual JSON object is well-formed.
+#
+# Fix: use `json.JSONDecoder.raw_decode` to walk proposed_text and pull out
+# consecutive JSON objects regardless of what sits between them (real
+# newline, whitespace, or the literal backslash-n artifact). This is a
+# strict superset of the old `.splitlines()` behaviour — well-formed
+# single-newline-separated JSONL still round-trips identically — and it
+# tolerates the escaping bug without silently accepting garbage: any byte
+# that isn't whitespace or the literal `\n` artifact between two valid JSON
+# objects still fails decoding and reports the same malformed-payload error.
+_JSONL_SEPARATOR_WS = " \t\r\n"
+
+
+def _skip_jsonl_separator(text: str, idx: int) -> int:
+    while idx < len(text):
+        if text[idx] in _JSONL_SEPARATOR_WS:
+            idx += 1
+        elif text[idx : idx + 2] == "\\n":
+            idx += 2
+        else:
+            break
+    return idx
+
+
+def _extract_jsonl_rows(text: str) -> tuple[list[object], str | None]:
+    """Parse ``text`` as zero or more JSON objects.
+
+    Returns ``(objects, None)`` on success or ``(partial_objects, error)``
+    where ``error`` is a human-readable message identifying the row index
+    (1-based) that failed to parse. Tolerates real newlines, whitespace, and
+    the literal backslash-n separator artifact between objects.
+    """
+    decoder = json.JSONDecoder()
+    objects: list[object] = []
+    idx = _skip_jsonl_separator(text, 0)
+    row_num = 0
+    while idx < len(text):
+        row_num += 1
+        try:
+            obj, end = decoder.raw_decode(text, idx)
+        except json.JSONDecodeError:
+            return objects, f"row {row_num} has malformed JSONL payload"
+        objects.append(obj)
+        idx = _skip_jsonl_separator(text, end)
+    return objects, None
+
+
 def _canonical_json_text(text: str) -> tuple[str, dict[str, Any]] | tuple[None, None]:
-    try:
-        parsed = json.loads(text)
-    except json.JSONDecodeError:
+    """Canonicalise a jsonl_append payload of 1..N JSON objects.
+
+    Returns the canonical newline-joined rows and the FIRST object (used for
+    lifecycle classification). Multi-row payloads are legal JSONL — see
+    validation._extract_jsonl_rows for the separator tolerance (dreamescape_0824).
+    """
+    objects, err = _extract_jsonl_rows(text)
+    if err or not objects or not all(isinstance(o, dict) for o in objects):
         return None, None
-    if not isinstance(parsed, dict):
-        return None, None
-    return json.dumps(parsed, sort_keys=True, ensure_ascii=False), parsed
+    canonical = "\n".join(json.dumps(o, sort_keys=True, ensure_ascii=False) for o in objects)
+    return canonical, objects[0]
 
 
 _SKILL_TARGET_RE = re.compile(r"^skills/[a-z0-9][a-z0-9_-]{0,63}\.md$")

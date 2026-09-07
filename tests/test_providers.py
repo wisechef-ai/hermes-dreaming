@@ -404,7 +404,14 @@ def test_openai_compatible_provider_dedupes_identical_append_text() -> None:
     assert len(result[0].provenance) == 2
 
 
-def test_openai_compatible_provider_still_errors_on_jsonl_append_conflict() -> None:
+def test_openai_compatible_provider_keeps_distinct_jsonl_rows_and_collapses_identical() -> None:
+    """Distinct jsonl_append rows to one file are additive (one JSON object per
+    row is the whole point of the mode); byte-identical rows collapse to one.
+
+    Tori fork divergence (2026-09-07): upstream errored here, which turned every
+    multi-fact night into an `invalid` artifact on a live model run. Proposed
+    upstream; keep this pin until it lands.
+    """
     from hermes_dreaming.artifact import DreamProposal
     from hermes_dreaming.providers import OpenAICompatibleProvider
 
@@ -417,10 +424,36 @@ def test_openai_compatible_provider_still_errors_on_jsonl_append_conflict() -> N
         )
 
     provider = OpenAICompatibleProvider(api_key="test")
-    json_props = [
-        mp("j1", '{"key":"a"}', "src1.md:1"),
-        mp("j2", '{"key":"b"}', "src2.md:1"),
-    ]
-    import pytest
-    with pytest.raises(Exception, match="conflicting proposals"):
-        provider._dedupe_proposals(json_props, payload_hash="test")
+    out = provider._dedupe_proposals(
+        [mp("j1", '{"key":"a"}', "src1.md:1"), mp("j2", '{"key":"b"}', "src2.md:1"), mp("j3", '{"key":"a"}', "src3.md:1")],
+        payload_hash="test",
+    )
+    assert sorted(p.proposed_text for p in out) == ['{"key":"a"}', '{"key":"b"}']
+    dup = next(p for p in out if p.proposed_text == '{"key":"a"}')
+    assert set(dup.provenance) == {"src1.md:1", "src3.md:1"}
+
+
+def test_openai_compatible_provider_drops_only_the_policy_invalid_proposal() -> None:
+    """One bad proposal must not void the batch (fail-partial, not fail-closed).
+
+    Tori fork divergence (2026-09-07): a live run produced 9 proposals; one
+    memory bullet was 5 lines (policy max 4) and the whole artifact went
+    `invalid` with 0 proposals. The 8 good ones are kept, the bad one is
+    reported as a note.
+    """
+    from hermes_dreaming.artifact import DreamProposal
+    from hermes_dreaming.providers import OpenAICompatibleProvider
+
+    def mp(pid: str, text: str) -> DreamProposal:
+        return DreamProposal(
+            id=pid, target_kind="memory", target_path="memory.md", mode="append_text",
+            summary=f"Memory {pid}", provenance=["src.md:1"], proposed_text=text,
+            approved=False, snippet="", risk="low", priority="normal",
+            reason="test", source_quote="", policy_flags=["test"],
+        )
+
+    good = mp("good", "- one concise bullet")
+    bad = mp("bad", "- line1\n- line2\n- line3\n- line4\n- line5")
+    kept, dropped = OpenAICompatibleProvider._drop_policy_invalid([good, bad])
+    assert [p.id for p in kept] == ["good"]
+    assert dropped and dropped[0][0] == "bad" and "too many lines" in dropped[0][1]

@@ -139,13 +139,21 @@ def _apply_append_text(current: str, addition: str) -> str:
     return current
 
 
+def _jsonl_rows(proposed_text: str) -> list[str]:
+    """Canonical JSON lines for a jsonl_append payload (1..N objects; see validation)."""
+    from .policy import _extract_jsonl_rows
+    objects, err = _extract_jsonl_rows(proposed_text)
+    if err or not objects:
+        raise DreamApplyError(err or "empty JSONL payload")
+    return [json.dumps(o, sort_keys=True, ensure_ascii=False) for o in objects]
+
+
 def _apply_jsonl_append(current: str, proposed_text: str) -> str:
-    proposed_text = proposed_text.strip()
-    line = json.dumps(json.loads(proposed_text), sort_keys=True, ensure_ascii=False)
     lines = [row.rstrip("\n") for row in current.splitlines() if row.strip()]
-    if line not in lines:
-        lines.append(line)
-    return ("\n".join(lines) + "\n") if lines else (line + "\n")
+    for line in _jsonl_rows(proposed_text):
+        if line not in lines:
+            lines.append(line)
+    return ("\n".join(lines) + "\n") if lines else ""
 
 
 def _apply_replace_text(proposed_text: str) -> str:
@@ -162,12 +170,19 @@ def _write_proposal(target: Path, proposal: DreamProposal, *, dry_run: bool = Fa
     updated = preview_proposal_content(current, proposal)
     if dry_run:
         return updated
+    # Tori fork: Hermes memory files (§-entries, injection budget, Cognee
+    # divert for facts/overflow) take the Hermes-native path; it writes AND
+    # verifies. Everything else is upstream's plain write.
+    from .hermes_memory import HERMES_MEMORY_TARGETS, write_hermes_proposal
+    if target.name in HERMES_MEMORY_TARGETS or (
+        proposal.mode == "jsonl_append" and proposal.target_kind == "fact" and target.name == "facts.jsonl"
+    ):
+        write_hermes_proposal(target, proposal)
+        return target.read_text(encoding="utf-8") if target.exists() else ""
     atomic_write_text(target, updated)
     verify_text = target.read_text(encoding="utf-8")
     if proposal.mode == "jsonl_append":
-        expected_line = json.loads(proposal.proposed_text)
-        expected_line = json.dumps(expected_line, sort_keys=True, ensure_ascii=False)
-        if expected_line not in verify_text:
+        if any(line not in verify_text for line in _jsonl_rows(proposal.proposed_text)):
             raise DreamApplyError(f"verification failed after writing {target}")
     elif proposal.proposed_text.strip() and proposal.proposed_text.strip() not in verify_text:
         raise DreamApplyError(f"verification failed after writing {target}")

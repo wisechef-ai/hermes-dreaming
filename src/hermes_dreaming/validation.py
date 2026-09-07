@@ -6,7 +6,7 @@ from pathlib import Path, PurePosixPath
 from typing import Iterable
 
 from .artifact import DreamArtifact, DreamProposal, SourceSnapshot, VALID_MODES, VALID_PRIORITY_LEVELS, VALID_RISK_LEVELS, VALID_TARGET_KINDS
-from .policy import evaluate_live_op, evaluate_proposal, target_path_is_allowed
+from .policy import _extract_jsonl_rows, evaluate_live_op, evaluate_proposal, target_path_is_allowed
 
 SECRET_PATTERNS = [
     re.compile(r"\b(sk-[A-Za-z0-9]{12,}|ghp_[A-Za-z0-9]{8,}|xox[baprs]-[A-Za-z0-9-]{8,}|AIza[0-9A-Za-z_-]{10,})\b"),
@@ -53,12 +53,16 @@ def _proposal_errors(proposal: DreamProposal) -> list[str]:
     if _secret_like(proposal.summary) or _secret_like(proposal.proposed_text) or _secret_like(proposal.snippet) or _secret_like(proposal.reason) or _secret_like(proposal.source_quote):
         errors.append(f"proposal {proposal.id} contains secret-like content")
     if proposal.mode == "jsonl_append":
-        try:
-            parsed = json.loads(proposal.proposed_text)
-        except json.JSONDecodeError:
-            errors.append(f"proposal {proposal.id} has malformed JSONL payload")
+        # Accept one JSON object, true JSONL (one per line), or objects joined by
+        # the literal backslash-n artifact (dreamescape_0824). Strict superset of
+        # a single json.loads — genuinely malformed rows still fail.
+        if not proposal.proposed_text.strip():
+            errors.append(f"proposal {proposal.id} has empty JSONL payload")
         else:
-            if not isinstance(parsed, dict):
+            objects, err = _extract_jsonl_rows(proposal.proposed_text)
+            if err:
+                errors.append(f"proposal {proposal.id} {err}")
+            elif not objects or not all(isinstance(o, dict) for o in objects):
                 errors.append(f"proposal {proposal.id} must serialize a JSON object for jsonl_append")
     return errors
 
@@ -74,11 +78,18 @@ def validate_proposals(proposals: Iterable[DreamProposal]) -> list[str]:
             errors.append(f"proposal {proposal.id}: {decision.error}")
             continue
 
-        existing = seen_targets.get(proposal.target_path)
+        # Distinct jsonl_append rows to the same file are additive, not conflicting
+        # (each row is its own JSON object); only append_text/replace_text collide.
+        target_key = (
+            f"{proposal.target_path}\x00{decision.normalized_text}"
+            if proposal.mode == "jsonl_append"
+            else proposal.target_path
+        )
+        existing = seen_targets.get(target_key)
         if existing is not None and existing != decision.normalized_text:
             errors.append(f"conflicting proposals target the same path {proposal.target_path!r}")
         else:
-            seen_targets[proposal.target_path] = decision.normalized_text
+            seen_targets[target_key] = decision.normalized_text
 
         if proposal.idempotence_key:
             existing_key = seen_keys.get(proposal.idempotence_key)
