@@ -38,19 +38,29 @@ from .providers import DreamContext, MARKER_RE
 
 # Map convenience aliases -> real Anthropic model IDs available on Claude Max.
 # Kept in sync with hermes-claude-oauth-bypass skill (Available Models table).
+#
+# MAINTENANCE RULE: the bare family aliases ("opus"/"sonnet"/"haiku") MUST always
+# point at the NEWEST released model in that family. This table shadows Hermes
+# core's auto-tracking resolver (models.py::_resolve_static_model_alias), so it
+# does NOT self-update on a new release -- bump the bare alias + DEFAULT_MODEL
+# here whenever Anthropic ships. Dated aliases below are pins for reproducibility
+# and should be left alone.
 _MODEL_ALIASES = {
-    "opus":   "claude-opus-4-7",
-    "opus-4": "claude-opus-4-7",
+    "opus":   "claude-opus-5",
+    "opus-5": "claude-opus-5",
+    "opus-4": "claude-opus-4-8",
     "opus-4-6": "claude-opus-4-6",
     "opus-4-7": "claude-opus-4-7",
-    "sonnet": "claude-sonnet-4-6",
+    "opus-4-8": "claude-opus-4-8",
+    "sonnet": "claude-sonnet-5",
+    "sonnet-5": "claude-sonnet-5",
     "sonnet-4-5": "claude-sonnet-4-5",
     "sonnet-4-6": "claude-sonnet-4-6",
     "haiku":  "claude-haiku-4-5",
     "haiku-4-5": "claude-haiku-4-5",
 }
 
-DEFAULT_MODEL = "claude-opus-4-7"
+DEFAULT_MODEL = "claude-opus-5"
 
 
 def _ensure_hermes_paths() -> None:
@@ -330,10 +340,25 @@ class AnthropicOAuthProvider:
             ],
         }
 
-        # Strip temperature on Opus 4.6/4.7 to avoid the adaptive-thinking 400.
-        # (The bypass also handles this on the main adapter path, but we're
-        # calling messages.create directly so we own it here.)
-        is_opus = "4-6" in self.model or "4-7" in self.model or "4.6" in self.model or "4.7" in self.model
+        # Strip temperature on Opus 4.6+ and Opus 5 to avoid the
+        # adaptive-thinking / "temperature is deprecated for this model" 400.
+        # All current Opus models (4-6, 4-7, 4-8, 5) reject the temperature
+        # parameter under the Claude Max OAuth path. (The bypass also handles
+        # this on the main adapter path, but we're calling messages.create
+        # directly so we own it here.)
+        #
+        # 2026-07-25: this guard matched only VERSIONED identifiers, so the
+        # bare alias "opus" (the cron's DREAMING_MODEL default) fell through,
+        # got temperature=0 attached, and 400'd the whole nightly run. Match
+        # family aliases too, and treat any unversioned alias as unsafe.
+        _m = self.model.lower()
+        is_opus = (
+            "opus" in _m
+            or "4-6" in _m or "4-7" in _m
+            or "4-8" in _m or "-5" in _m
+            or "4.6" in _m or "4.7" in _m
+            or "4.8" in _m
+        )
         if not is_opus:
             kwargs["temperature"] = 0
 
@@ -369,6 +394,27 @@ class AnthropicOAuthProvider:
                 break
             except _RETRYABLE as exc:
                 status = getattr(exc, "status_code", None)
+
+                # Self-heal the "`temperature` is deprecated for this model"
+                # 400 (2026-07-25). The static family guard above should catch
+                # every known case, but model naming drifts faster than this
+                # file does — a NEW model that rejects temperature must not be
+                # able to kill an entire nightly run. Strip the offending
+                # parameter once and retry immediately.
+                if (
+                    status == 400
+                    and "temperature" in str(exc).lower()
+                    and "temperature" in kwargs
+                ):
+                    kwargs.pop("temperature", None)
+                    print(
+                        f"[anthropic-oauth-provider] model {self.model!r} "
+                        f"rejected `temperature` — stripping it and retrying "
+                        f"(attempt {attempt}/{max_attempts})",
+                        file=sys.stderr,
+                    )
+                    continue
+
                 transient = status is None or status in (429, 500, 502, 503, 529)
                 if not transient or attempt == max_attempts:
                     raise

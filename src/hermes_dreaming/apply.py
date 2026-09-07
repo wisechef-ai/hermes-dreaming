@@ -9,7 +9,7 @@ from pathlib import Path, PurePosixPath
 import tempfile
 
 from .artifact import DreamArtifact, DreamProposal, load_artifact, write_artifact
-from .validation import validate_artifact
+from .validation import _extract_jsonl_rows, validate_artifact
 
 
 def _utc_now_iso() -> str:
@@ -277,23 +277,27 @@ def _apply_hermes_facts_append(current: str, addition: str) -> str:
 
     Hermes's memory loader doesn't read ``facts.jsonl``. Routing fact-kind
     proposals to MEMORY.md as plain-text entries (prefixed ``[fact]``) is
-    the only way they become visible to the running agent."""
+    the only way they become visible to the running agent.
+
+    dreamescape_0824: uses the same tolerant `_extract_jsonl_rows` walker as
+    validation.py so a payload the validator accepted (real newline,
+    whitespace, OR the literal backslash-n artifact between objects) never
+    fails to apply here. Falls back to one `[fact] <line>` per raw line only
+    when the payload doesn't parse as JSON at all (pre-existing behaviour)."""
+    objects, err = _extract_jsonl_rows(addition)
     rows: list[str] = []
-    for raw in addition.splitlines():
-        raw = raw.strip()
-        if not raw:
-            continue
-        try:
-            parsed = json.loads(raw)
-        except json.JSONDecodeError:
-            # Treat as a plain-text fact if not parseable.
-            rows.append(f"[fact] {raw}")
-            continue
-        if isinstance(parsed, dict):
-            text = parsed.get("fact") or parsed.get("summary") or json.dumps(parsed, ensure_ascii=False)
-            rows.append(f"[fact] {text}")
-        else:
-            rows.append(f"[fact] {parsed}")
+    if err or not objects:
+        for raw in addition.splitlines():
+            raw = raw.strip()
+            if raw:
+                rows.append(f"[fact] {raw}")
+    else:
+        for parsed in objects:
+            if isinstance(parsed, dict):
+                text = parsed.get("fact") or parsed.get("summary") or json.dumps(parsed, ensure_ascii=False)
+                rows.append(f"[fact] {text}")
+            else:
+                rows.append(f"[fact] {parsed}")
 
     addition_as_text = HERMES_ENTRY_DELIMITER.join(rows)
     return _apply_hermes_memory_append(current, addition_as_text, HERMES_MEMORY_MAX_PER_ENTRY)
@@ -302,17 +306,15 @@ def _apply_hermes_facts_append(current: str, addition: str) -> str:
 def _apply_jsonl_append(current: str, proposed_text: str) -> str:
     """Append one or more JSON rows to a JSONL file.
 
-    proposed_text may be either a single JSON object, or multiple objects
-    one-per-non-empty-line. Each row is normalised (sort_keys, no whitespace
-    changes) and deduplicated against existing rows in the file."""
-    rows: list[str] = []
-    for raw in proposed_text.splitlines():
-        raw = raw.strip()
-        if not raw:
-            continue
-        rows.append(json.dumps(json.loads(raw), sort_keys=True, ensure_ascii=False))
-    if not rows:
-        rows.append(json.dumps(json.loads(proposed_text.strip()), sort_keys=True, ensure_ascii=False))
+    proposed_text may be a single JSON object, multiple objects one-per-
+    non-empty-line, or multiple objects joined by the literal backslash-n
+    artifact (dreamescape_0824 — see validation.py's `_extract_jsonl_rows`).
+    Each row is normalised (sort_keys, no whitespace changes) and
+    deduplicated against existing rows in the file."""
+    objects, err = _extract_jsonl_rows(proposed_text)
+    if err or not objects:
+        raise DreamApplyError(f"cannot apply jsonl_append: {err or 'empty payload'}")
+    rows = [json.dumps(obj, sort_keys=True, ensure_ascii=False) for obj in objects]
 
     existing = [row.rstrip("\n") for row in current.splitlines() if row.strip()]
     for row in rows:
@@ -363,13 +365,19 @@ def _write_proposal(target: Path, proposal: DreamProposal) -> None:
         # which is reserved for guardrails/IDs under the injection budget.
         # facts.jsonl still gets the raw rows as a local audit log.
         if proposal.target_kind == "fact" and target_name == "facts.jsonl":
+            # dreamescape_0824: same tolerant row walker as _apply_jsonl_append
+            # — handles real-newline, whitespace, and literal backslash-n
+            # separated payloads identically instead of a second bespoke
+            # splitlines()+json.loads that would re-break on the escaped form.
             fact_entries: list[str] = []
-            for raw in proposal.proposed_text.splitlines():
-                raw = raw.strip()
-                if not raw:
-                    continue
-                try:
-                    parsed = json.loads(raw)
+            objects, err = _extract_jsonl_rows(proposal.proposed_text)
+            if err or not objects:
+                for raw in proposal.proposed_text.splitlines():
+                    raw = raw.strip()
+                    if raw:
+                        fact_entries.append(raw)
+            else:
+                for parsed in objects:
                     if isinstance(parsed, dict):
                         fact_entries.append(
                             str(parsed.get("fact") or parsed.get("summary")
@@ -377,8 +385,6 @@ def _write_proposal(target: Path, proposal: DreamProposal) -> None:
                         )
                     else:
                         fact_entries.append(str(parsed))
-                except json.JSONDecodeError:
-                    fact_entries.append(raw)
             results = _divert_to_cognee(fact_entries, kind="fact", provenance=provenance)
             sent = sum(1 for r in results if r.get("sent"))
             spooled = sum(1 for r in results if r.get("spooled"))
@@ -399,13 +405,16 @@ def _write_proposal(target: Path, proposal: DreamProposal) -> None:
 
     verify_text = target.read_text(encoding="utf-8")
     if proposal.mode == "jsonl_append":
-        # Every emitted row should be present after the write. Tolerate
-        # multi-row payloads (one JSON object per line in proposed_text).
-        for raw in proposal.proposed_text.splitlines():
-            raw = raw.strip()
-            if not raw:
-                continue
-            expected = json.dumps(json.loads(raw), sort_keys=True, ensure_ascii=False)
+        # Every emitted row should be present after the write.
+        # dreamescape_0824: use the same tolerant walker as apply — the old
+        # splitlines()+json.loads verify loop would raise on the exact
+        # payload shape (backslash-n separated rows) that apply/validation
+        # now accept, turning a successful apply into a false failure.
+        objects, err = _extract_jsonl_rows(proposal.proposed_text)
+        if err:
+            raise DreamApplyError(f"verification failed after writing {target}: {err}")
+        for obj in objects:
+            expected = json.dumps(obj, sort_keys=True, ensure_ascii=False)
             if expected not in verify_text:
                 raise DreamApplyError(f"verification failed after writing {target}")
     elif target_name in HERMES_MEMORY_TARGETS:

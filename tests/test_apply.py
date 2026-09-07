@@ -194,3 +194,39 @@ def test_full_apply_reports_applied_and_flags_all(tmp_path: Path) -> None:
     assert all(p.applied for p in reloaded.proposals)
     assert reloaded.status == "applied"
 
+
+def test_apply_jsonl_append_handles_literal_backslash_n_separated_rows(tmp_path: Path) -> None:
+    """dreamescape_0824 regression — apply path, not just validation.
+
+    Same escaping-bug payload as the validation regression test: multiple
+    JSON objects joined by the literal two-char text ``\\n`` instead of a
+    real newline. Must apply cleanly, land both rows in facts.jsonl, and
+    pass the post-write verification loop (which independently re-parses
+    proposed_text and used to share the same splitlines() bug).
+    """
+    live_root = tmp_path / "live"
+    live_root.mkdir()
+
+    proposal = DreamProposal(
+        id="proposal-fact-backslash-n",
+        target_kind="fact",
+        target_path="facts.jsonl",
+        mode="jsonl_append",
+        summary="two facts joined by literal backslash-n (escaping bug)",
+        provenance=["sessions/1.md:1"],
+        proposed_text='{"fact": "AGENTPACT apps/web is Fastify"}\\n{"fact": "LOOPSKILL has no bundle install verb"}',
+        approved=True,
+    )
+    artifact_dir, _artifact_result = _artifact(tmp_path, proposal)
+
+    result = apply_artifact(
+        artifact_dir, live_root=live_root, backup_root=tmp_path / "backups", approve_all=True
+    )
+
+    assert result.status == "applied"
+    facts_text = (live_root / "facts.jsonl").read_text(encoding="utf-8")
+    assert "AGENTPACT apps/web is Fastify" in facts_text
+    assert "LOOPSKILL has no bundle install verb" in facts_text
+    # Two distinct rows landed, not one mangled row.
+    assert len([line for line in facts_text.splitlines() if line.strip()]) == 2
+
