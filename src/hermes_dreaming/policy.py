@@ -202,10 +202,13 @@ def target_path_is_allowed(target_kind: str, target_path: str) -> bool:
     path_text = path.as_posix()
     if path.is_absolute() or any(part in {"..", ""} for part in path.parts):
         return False
+    # Hermes' live files are UPPERCASE (~/.hermes/memories/MEMORY.md, USER.md);
+    # upstream's quickstart uses lowercase. Both are the same target — apply.py
+    # already prefers an existing uppercase file (v0.3.0). Compare case-folded.
     if target_kind == "memory":
-        return path_text == "memory.md"
+        return path_text.lower() == "memory.md"
     if target_kind == "user":
-        return path_text == "user.md"
+        return path_text.lower() == "user.md"
     if target_kind == "fact":
         return path_text == "facts.jsonl"
     if target_kind == "skill":
@@ -217,11 +220,15 @@ def _target_path_is_safe(target_kind: str, target_path: str) -> bool:
     return target_path_is_allowed(target_kind, target_path)
 
 
-def _entry_too_sloppy(target_kind: str, text: str) -> str:
+def _entry_too_sloppy(target_kind: str, text: str, target_path: str = "") -> str:
     lines = text.splitlines()
     words = [word for word in re.split(r"\s+", text.strip()) if word]
     if target_kind in {"memory", "user"}:
-        if not text.startswith("-"):
+        # Hermes' MEMORY.md / USER.md (uppercase) are §-delimited dense prose
+        # entries, not markdown bullets — the bullet rule is upstream's lowercase
+        # quickstart format. Everything else (length, one paragraph, slop) applies.
+        hermes_format = target_path.rsplit("/", 1)[-1] in {"MEMORY.md", "USER.md"}
+        if not hermes_format and not text.startswith("-"):
             return "bullet entry required"
         if len(lines) > TARGET_POLICY[target_kind]["max_lines"]:
             return "too many lines for a memory entry"
@@ -396,7 +403,7 @@ def evaluate_proposal(
         if lifecycle != "active":
             warnings.append(f"fact lifecycle classified as {lifecycle}")
     else:
-        entry_problem = _entry_too_sloppy(target_kind, normalized_text)
+        entry_problem = _entry_too_sloppy(target_kind, normalized_text, proposal.target_path)
         if entry_problem:
             return PolicyDecision(
                 ok=False,

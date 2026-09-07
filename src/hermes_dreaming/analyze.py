@@ -4,6 +4,7 @@ from collections import Counter
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 import json
+import sys
 import re
 from pathlib import Path
 from uuid import uuid4
@@ -326,7 +327,14 @@ def create_dream_artifact(config: DreamRunConfig) -> DreamCreationResult:
     provider_failure: str | None = None
     provider_payload_hash: str | None = None
     try:
-        report_body, proposals, _notes = provider.generate(source_snapshots, context)
+        report_body, proposals, notes = provider.generate(source_snapshots, context)
+        # Provider notes are operator signal (fail-partial drops, fallbacks). Never
+        # discard them: append to the report AND echo to stderr so the cron log
+        # explains a low/zero proposal count instead of leaving it a mystery.
+        if notes:
+            report_body = report_body.rstrip() + "\n\n## Provider notes\n\n" + "\n".join(f"- {n}" for n in notes) + "\n"
+            for n in notes:
+                print(f"[dreaming-provider-note] {n}", file=sys.stderr)
     except Exception as exc:
         provider_failure = str(exc)
         provider_payload_hash = getattr(exc, "payload_hash", None)

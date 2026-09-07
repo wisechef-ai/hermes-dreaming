@@ -455,7 +455,9 @@ class AnthropicOAuthProvider:
         proposals_raw = payload.get("proposals", []) or []
         proposals = [DreamProposal.from_dict(item) for item in proposals_raw]
         proposals = _normalize_provenance(proposals, sources)
-        notes = [str(item) for item in payload.get("notes", []) or []]
+        raw_notes = payload.get("notes", []) or []
+        # Models sometimes return notes as one string; iterating it would yield chars.
+        notes = [raw_notes] if isinstance(raw_notes, str) else [str(item) for item in raw_notes]
 
         # True fallback ONLY: if the model returned zero proposals but the
         # source bundle contained explicit DREAM: markers, harvest them so

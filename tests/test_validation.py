@@ -187,3 +187,32 @@ def test_validate_still_rejects_genuinely_malformed_jsonl_row(tmp_path: Path) ->
 
     assert errors
     assert any("malformed jsonl payload" in error.lower() for error in errors)
+
+
+def test_validate_allows_uppercase_hermes_memory_targets(tmp_path: Path) -> None:
+    """Hermes live files are MEMORY.md / USER.md. Regression 2026-09-07: v0.4.0's
+    lowercase-only path policy silently dropped every memory/user proposal the
+    Anthropic provider produced (8 -> 0) on the first live run after the upgrade."""
+    for kind, path in (("memory", "MEMORY.md"), ("user", "USER.md")):
+        proposal = DreamProposal(
+            id=f"p-{kind}", target_kind=kind, target_path=path, mode="append_text",
+            summary="s", provenance=["sessions/1.md:1"], proposed_text="- concise bullet", approved=True,
+        )
+        errors = validate_artifact(_artifact_with(proposal, tmp_path), live_root=tmp_path)
+        assert not [e for e in errors if "not allowed" in e or "unsafe" in e], errors
+
+
+def test_validate_hermes_memory_entries_need_no_bullet_but_lowercase_still_does(tmp_path: Path) -> None:
+    """Hermes MEMORY.md/USER.md entries are dense prose (§-delimited). Upstream's
+    'bullet entry required' rule stays for the lowercase quickstart format."""
+    prose = DreamProposal(
+        id="p-prose", target_kind="memory", target_path="MEMORY.md", mode="append_text",
+        summary="s", provenance=["sessions/1.md:1"], approved=True,
+        proposed_text="DREAMING(0907): children on superqwen fail file-surgery in worktrees; do it in-session.",
+    )
+    assert not [e for e in validate_artifact(_artifact_with(prose, tmp_path), live_root=tmp_path) if "bullet" in e]
+    lower = DreamProposal(
+        id="p-lower", target_kind="memory", target_path="memory.md", mode="append_text",
+        summary="s", provenance=["sessions/1.md:1"], approved=True, proposed_text="no bullet here",
+    )
+    assert any("bullet" in e for e in validate_artifact(_artifact_with(lower, tmp_path), live_root=tmp_path))
