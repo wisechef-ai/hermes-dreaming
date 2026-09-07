@@ -104,11 +104,11 @@ SYSTEM_PROMPT = (
     "    * user-profile updates: target_path = \"USER.md\"\n"
     "    * fact appends: target_path = \"facts.jsonl\" (mode jsonl_append)\n"
     "    * skill updates: target_path = \"skills/<category>/<name>/SKILL.md\"\n"
-    "  - For mode=jsonl_append, proposed_text may contain EITHER one JSON\n"
-    "    object OR multiple JSON objects one-per-line (true JSONL). When\n"
-    "    you have several distinct facts to record, prefer ONE jsonl_append\n"
-    "    proposal whose proposed_text is multi-line JSONL — that keeps the\n"
-    "    artifact compact and avoids same-target proposal sprawl.\n"
+    "  - For mode=jsonl_append, proposed_text is ONE JSON object per proposal,\n"
+    "    and the whole object (serialised) must stay under 320 chars. Several\n"
+    "    distinct facts = several fact proposals to facts.jsonl — the validator\n"
+    "    treats distinct rows as additive, never as a conflict. NEVER bundle\n"
+    "    multiple facts into one row; an over-budget row is dropped.\n"
     "  - provenance MUST be a JSON array of STRINGS, where each string is a\n"
     "    source pointer like \"<absolute-or-relative-path>:<line-number>\".\n"
     "    Do NOT split a path into one character per array element.\n"
@@ -123,22 +123,22 @@ SYSTEM_PROMPT = (
     "  - Per-entry hard limit: 2200 chars for MEMORY.md, 1375 chars for\n"
     "    USER.md. Anything over trips the drift guard and breaks future\n"
     "    memory writes.\n"
-    "  - YOUR proposed_text should be AT MOST ~400 chars per atomic entry.\n"
-    "    If you have multiple distinct ideas to capture, emit MULTIPLE\n"
-    "    proposals (one per atomic entry), NOT one big proposal with several\n"
-    "    `##` headings. Smaller entries recall better and survive the\n"
-    "    char-budget pressure.\n"
+    "  - POLICY HARD LIMITS (v0.4.0, a proposal over these is DROPPED):\n"
+    "    memory entry <= 240 chars and <= 4 lines; user entry <= 220 chars\n"
+    "    and <= 4 lines; one paragraph, no blank lines inside an entry.\n"
+    "    If you have multiple distinct ideas, emit MULTIPLE proposals (one per\n"
+    "    atomic entry), NOT one big proposal with several `##` headings.\n"
+    "    Smaller entries recall better and survive the char-budget pressure.\n"
     "  - Write entries in the dense, abbreviated style of MEMORY.md (codename:\n"
     "    detail; PREF:/RULE: prefixes; ID + value pairs; no narrative prose).\n"
     "    Look at the source bundle for examples of the house style.\n"
     "\n"
     "FACT ROUTING (for target_kind=fact):\n"
     "  - Hermes does NOT have a facts.jsonl loader. The apply step routes\n"
-    "    fact-kind proposals to MEMORY.md as `[fact] ...` §-entries automatically.\n"
-    "  - You can still emit JSONL — the apply step pulls the `fact` or\n"
-    "    `summary` field and writes `[fact] <text>` as one memory entry per row.\n"
-    "  - Keep each row's `fact`/`summary` field short and self-contained,\n"
-    "    under 400 chars, written in the dense MEMORY.md house style.\n"
+    "    fact-kind proposals to Cognee (Layer-2 brain, auto-recalled) and keeps\n"
+    "    facts.jsonl only as a local audit log. Facts never touch MEMORY.md.\n"
+    "  - One row per proposal; the `fact` (or `summary`) field is the payload.\n"
+    "    Keep the SERIALISED object under 320 chars, dense house style.\n"
     "\n"
     "Never include secrets, tokens, or hardcoded personal data.\n"
     "\n"
@@ -292,10 +292,10 @@ class AnthropicOAuthProvider:
     ) -> tuple[str, list[DreamProposal], list[str]]:
         _ensure_hermes_paths()
         try:
-            from agent.anthropic_adapter import (
-                resolve_anthropic_token,
-                build_anthropic_client,
-            )
+            # hermes-agent Sep-2026 decomposition: the token resolver moved to
+            # agent.anthropic_credentials; the compat shim is deleted 2026-09-14.
+            from agent.anthropic_adapter import build_anthropic_client
+            from agent.anthropic_credentials import resolve_anthropic_token
         except ImportError as exc:
             raise RuntimeError(
                 "Hermes agent.anthropic_adapter is not importable. "

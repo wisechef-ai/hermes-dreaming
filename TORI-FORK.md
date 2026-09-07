@@ -39,10 +39,7 @@ Rollback: `git checkout fork-v010-final` (or
 
 ## Known remaining
 
-- `agent.anthropic_adapter.resolve_anthropic_token` compat warning: hermes-agent moved it to
-  `agent.anthropic_credentials`; compat shims are removed upstream **2026-09-14**. Update the
-  import in `anthropic_oauth_provider.py` before then.
-- Legit policy drops seen live: Opus batches 4 gotchas into one fact (>320c) and writes 5-line
-  memory entries. Prompt already says one fact per row; if drops persist, tighten the prompt in
-  `anthropic_oauth_provider.py`, not the policy.
+- (done 0907) import moved to `agent.anthropic_credentials.resolve_anthropic_token` ahead of the
+  2026-09-14 compat-shim removal; prompt now states the v0.4.0 hard limits (240/220/320c, 4 lines,
+  one fact per row). Live: 8 → 4 staged, 1 drop (5-line entry) — acceptable, logged.
 - `hermes dreaming -- install-cron` (upstream) is NOT used; our driver is `scripts/dreaming_cron.sh`.
