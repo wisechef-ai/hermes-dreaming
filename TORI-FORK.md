@@ -37,6 +37,24 @@ Rollback: `git checkout fork-v010-final` (or
    `temperature` 400 self-heal; registered in `build_provider` + `list_providers`.
 9. `cli.py` — `HERMES_DREAMING_*` env defaults and bare-artifact-id resolution.
 
+## Auto-update (keeps tracking upstream without losing this layer)
+
+- Remotes: `origin` = wisechef-ai/hermes-dreaming (our fork, what `main` pushes to),
+  `upstream` = asimons81/hermes-dreaming.
+- Cron `dreaming-upstream-sync` (`e5dd97aec626`, Sun 04:30, no_agent, → #tori) runs
+  `~/.hermes/scripts/dreaming_upstream_sync.sh`: fetch upstream → rebase `main` onto
+  `upstream/main` in a throwaway worktree → run this repo's pytest → probe all 9
+  divergences above → only then fast-forward `main`, tag `pre-sync-<date>`, push origin.
+  Any conflict / red test / missing divergence → `[ESCALATE]` line to #tori, `main`
+  untouched. Never auto-resolves conflicts. Silent when upstream has nothing new.
+- Goal predicate `goals/dreaming-fork-current.md` (daily sweep) fails loudly if the sync
+  stops firing (>9d), a divergence disappears, the tree goes dirty, or the nightly
+  produces no valid artifact for 3 days.
+- `hermes update` does NOT touch `~/.hermes/plugins/*` — this cron is the only updater.
+  The 03:45 dreaming cron is a fresh process, so it picks up a synced `main` with no restart.
+- Manual: `bash ~/.hermes/scripts/dreaming_upstream_sync.sh` (or `--probe` / `--self-test`).
+  Rollback a bad sync: `git reset --hard pre-sync-<date>`.
+
 ## Known remaining
 
 - (done 0907) import moved to `agent.anthropic_credentials.resolve_anthropic_token` ahead of the
