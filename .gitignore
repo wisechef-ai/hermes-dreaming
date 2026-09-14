@@ -14,3 +14,4 @@ htmlcov/
 .dreaming/
 .hermes/
 .DS_Store
+.worktrees/
