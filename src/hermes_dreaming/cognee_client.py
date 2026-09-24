@@ -6,7 +6,7 @@ the 2,200-char MEMORY.md injection window.
 
 Design rules:
 - Vendored REST client, no SDK dep — same multipart /api/v1/add shape as
-  ~/.hermes/scripts/gbrain_to_cognee_facts.py (the proven bridge).
+  the former gbrain_to_cognee_facts.py bridge (retired with GBrain 2026-09-23).
 - FAIL-SAFE, never FAIL-OPEN-SILENT: when Cognee is unreachable the fact
   is spooled to ~/.hermes/dreaming/cognee-spool/ and retried on the next
   apply/cron run via flush_spool(). A distilled fact is never dropped.
