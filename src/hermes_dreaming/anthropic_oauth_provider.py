@@ -27,6 +27,8 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
+import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -46,7 +48,8 @@ from .providers import DreamContext, MARKER_RE
 # here whenever Anthropic ships. Dated aliases below are pins for reproducibility
 # and should be left alone.
 _MODEL_ALIASES = {
-    "opus":   "claude-opus-5",
+    "opus":   "claude-opus-5-5",
+    "opus-5-5": "claude-opus-5-5",
     "opus-5": "claude-opus-5",
     "opus-4": "claude-opus-4-8",
     "opus-4-6": "claude-opus-4-6",
@@ -60,7 +63,7 @@ _MODEL_ALIASES = {
     "haiku-4-5": "claude-haiku-4-5",
 }
 
-DEFAULT_MODEL = "claude-opus-5"
+DEFAULT_MODEL = "claude-opus-5-5"
 
 
 def _ensure_hermes_paths() -> None:
@@ -83,11 +86,44 @@ def _resolve_model(model: str | None) -> str:
     return _MODEL_ALIASES.get(key, model)
 
 
+# Floor used only when no `claude` binary can be found. It must stay >= the
+# minimum Claude Code version the DEFAULT_MODEL accepts: claude-opus-5-5
+# rejects anything older than 2.1.280 with HTTP 400 "does not support this
+# model" (regression 2026-09-24, when this was a stale hardcoded 2.1.117).
+_CLI_VERSION_FLOOR = "2.1.280"
+_CLI_CANDIDATES = ("~/.local/bin/claude", "~/.claude/local/claude", "/usr/local/bin/claude",
+                   "/opt/homebrew/bin/claude")
+_cli_version_cache: str | None = None
+
+
+def _detect_installed_cli_version() -> str | None:
+    """`claude --version` of the installed Claude Code, or None."""
+    paths = [shutil.which("claude")] + [os.path.expanduser(c) for c in _CLI_CANDIDATES]
+    for path in dict.fromkeys(p for p in paths if p):
+        try:
+            r = subprocess.run([path, "--version"], capture_output=True, text=True, timeout=10)
+        except (OSError, subprocess.SubprocessError):
+            continue
+        if r.returncode == 0 and r.stdout.strip():
+            ver = r.stdout.strip().split()[0]  # "2.1.280 (Claude Code)"
+            if ver[:1].isdigit():
+                return ver
+    return None
+
+
 def _get_cli_version() -> str:
-    """Fallback CLI version string; the bypass module owns the canonical
-    detection but exposes it indirectly. Hardcoding a recent default is fine
-    because the bypass overrides it on the wire via httpx hook."""
-    return os.environ.get("HERMES_DREAMING_CLI_VERSION", "2.1.117")
+    """Claude Code version advertised to the API.
+
+    Order: HERMES_DREAMING_CLI_VERSION env override > installed binary >
+    _CLI_VERSION_FLOOR. Never a stale literal: new models gate on it.
+    """
+    global _cli_version_cache
+    env = os.environ.get("HERMES_DREAMING_CLI_VERSION")
+    if env:
+        return env
+    if _cli_version_cache is None:
+        _cli_version_cache = _detect_installed_cli_version() or _CLI_VERSION_FLOOR
+    return _cli_version_cache
 
 
 SYSTEM_PROMPT = (
