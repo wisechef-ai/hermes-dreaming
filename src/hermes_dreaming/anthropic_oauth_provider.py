@@ -131,7 +131,17 @@ SYSTEM_PROMPT = (
     "You are Hermes Dreaming, a staged self-improvement engine for the Hermes\n"
     "agent. Return JSON only with keys: report, proposals, notes.\n"
     "Each proposal must include id, target_kind, target_path, mode, summary, "
-    "provenance, proposed_text, approved.\n"
+    "provenance, proposed_text, approved, confidence, reason, source_quote.\n"
+    "\n"
+    "EVIDENCE FIELDS (reviewers DISCARD proposals that lack them):\n"
+    "  - confidence: a NUMBER in [0.0, 1.0], calibrated, never omitted:\n"
+    "      0.9+    stated verbatim in the cited source line AND durable\n"
+    "              (still true next month);\n"
+    "      0.6-0.8 inferred from the source, or likely to change;\n"
+    "      <0.5    speculative - prefer not proposing it at all.\n"
+    "  - reason: ONE line - why this is durable and who/what will recall it.\n"
+    "  - source_quote: the VERBATIM text of the first provenance line (copy,\n"
+    "    never paraphrase). If you cannot quote it, do not propose it.\n"
     "\n"
     "STRICT FIELD CONTRACT:\n"
     "  - target_kind in {memory, user, skill, fact}\n"
@@ -492,6 +502,7 @@ class AnthropicOAuthProvider:
         proposals_raw = payload.get("proposals", []) or []
         proposals = [DreamProposal.from_dict(item) for item in proposals_raw]
         proposals = _normalize_provenance(proposals, sources)
+        proposals = _ground_evidence(proposals, proposals_raw, sources)
         raw_notes = payload.get("notes", []) or []
         # Models sometimes return notes as one string; iterating it would yield chars.
         notes = [raw_notes] if isinstance(raw_notes, str) else [str(item) for item in raw_notes]
@@ -554,6 +565,65 @@ def _normalize_provenance(
         p.provenance = prov
         out.append(p)
     return out
+
+
+CONFIDENCE_UNSCORED_FLAG = "confidence_unscored"
+
+
+def _resolve_source_line(ref: str, sources: list[SourceSnapshot]) -> str:
+    """Return the text of a ``<path>:<line>`` provenance ref, or ``""``.
+
+    Matches the source by full path first, then by basename (the model often
+    cites the bundle by its file name). Never raises: an unresolvable ref is
+    an empty quote, not a crash.
+    """
+    path, sep, line = str(ref).rpartition(":")
+    if not sep or not line.strip().isdigit():
+        return ""
+    n = int(line.strip())
+    for source in sources:
+        if source.path == path or Path(source.path).name == Path(path).name:
+            lines = source.content.splitlines()
+            if 1 <= n <= len(lines):
+                return lines[n - 1].strip()
+    return ""
+
+
+def _ground_evidence(
+    proposals: list[DreamProposal],
+    raw_items: list[Any],
+    sources: list[SourceSnapshot],
+) -> list[DreamProposal]:
+    """Make every proposal's evidence fields honest.
+
+    Before 2026-10-05 this provider never asked for confidence/reason/
+    source_quote, so ``DreamProposal.from_dict`` defaulted every proposal to
+    ``confidence=0.0`` with empty evidence (59/59 proposals across 14 nightly
+    artifacts), and reviewers read the missing score as "the dreamer is
+    unsure" and DISCARDed. Two deterministic repairs:
+
+    * a model that omits (or mis-types) ``confidence`` gets the
+      ``confidence_unscored`` policy flag, so 0.0 can no longer impersonate
+      a real low score;
+    * an empty ``source_quote``/``snippet`` is backfilled from the first
+      resolvable provenance line, so a reviewer can check the claim against
+      its source without opening the bundle.
+    """
+    for index, proposal in enumerate(proposals):
+        raw = raw_items[index] if index < len(raw_items) and isinstance(raw_items[index], dict) else {}
+        value = raw.get("confidence")
+        unscored = isinstance(value, bool) or not isinstance(value, (int, float))
+        if unscored and CONFIDENCE_UNSCORED_FLAG not in proposal.policy_flags:
+            proposal.policy_flags.append(CONFIDENCE_UNSCORED_FLAG)
+        if not (proposal.source_quote or "").strip():
+            for ref in proposal.provenance:
+                quote = _resolve_source_line(ref, sources)
+                if quote:
+                    proposal.source_quote = quote[:500]
+                    break
+        if not (proposal.snippet or "").strip() and proposal.source_quote:
+            proposal.snippet = proposal.source_quote
+    return proposals
 
 
 def _coalesce_appends(proposals: list[DreamProposal]) -> list[DreamProposal]:
