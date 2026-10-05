@@ -129,6 +129,10 @@ def test_generate_end_to_end_flags_and_grounds(monkeypatch, tmp_path):
     monkeypatch.setitem(sys.modules, "agent.anthropic_adapter", adapter)
     monkeypatch.setitem(sys.modules, "agent.anthropic_credentials", creds)
     monkeypatch.setitem(sys.modules, "anthropic_billing_bypass", None)  # import -> ImportError
+    sdk = types.ModuleType("anthropic")  # hermetic: the retry ladder only needs the exception types
+    for exc in ("APIStatusError", "APIConnectionError", "APITimeoutError"):
+        setattr(sdk, exc, type(exc, (Exception,), {}))
+    monkeypatch.setitem(sys.modules, "anthropic", sdk)
     monkeypatch.setattr(mod, "_ensure_hermes_paths", lambda: None)
 
     ctx = DreamContext(workspace_root=tmp_path, live_root=tmp_path, artifact_dir=tmp_path,
