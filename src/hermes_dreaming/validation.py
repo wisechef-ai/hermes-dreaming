@@ -15,6 +15,12 @@ SECRET_PATTERNS = [
 ]
 
 
+# Target kinds whose append_text proposals are atomic entries (one fact each,
+# capped per entry by policy.TARGET_POLICY). Distinct entries never conflict
+# and are never merged.
+ATOMIC_ENTRY_KINDS = frozenset({"memory", "user"})
+
+
 def _secret_like(text: str) -> bool:
     return any(pattern.search(text) for pattern in SECRET_PATTERNS)
 
@@ -79,10 +85,13 @@ def validate_proposals(proposals: Iterable[DreamProposal]) -> list[str]:
             continue
 
         # Distinct jsonl_append rows to the same file are additive, not conflicting
-        # (each row is its own JSON object); only append_text/replace_text collide.
+        # (each row is its own JSON object). So are distinct memory/user entries
+        # (ah_1010): each is one atomic append under a per-entry cap, so merging
+        # them is what made them fail the cap. Other append_text bodies collide.
         target_key = (
             f"{proposal.target_path}\x00{decision.normalized_text}"
             if proposal.mode == "jsonl_append"
+            or (proposal.mode == "append_text" and proposal.target_kind in ATOMIC_ENTRY_KINDS)
             else proposal.target_path
         )
         existing = seen_targets.get(target_key)

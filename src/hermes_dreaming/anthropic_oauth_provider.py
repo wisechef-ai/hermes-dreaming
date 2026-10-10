@@ -35,6 +35,7 @@ from pathlib import Path
 from typing import Any
 
 from .artifact import DreamProposal, SourceSnapshot
+from .validation import ATOMIC_ENTRY_KINDS
 from .providers import DreamContext, MARKER_RE
 
 
@@ -633,12 +634,20 @@ def _coalesce_appends(proposals: list[DreamProposal]) -> list[DreamProposal]:
     same file as a conflict. When the LLM emits two memory updates that
     both land in MEMORY.md, that's not a conflict — it's two things to
     append. Concatenate their bodies, merge provenance, keep the first id.
-    Non-append_text proposals pass through unchanged."""
+    Non-append_text proposals pass through unchanged.
+
+    Memory and user entries are NEVER coalesced (ah_1010). Each one is an
+    atomic entry under a per-entry policy cap (240/220 chars, 4 lines), and the
+    prompt asks for one proposal per entry. Gluing two of them produced one body
+    over the cap, which the policy gate then dropped whole: about 23 of 30
+    nights lost every memory they found. The validator keys memory/user appends
+    by path + text, so distinct entries are no longer a conflict, and apply
+    re-reads the file per proposal, so each one lands as its own entry."""
     grouped: dict[tuple[str, str, str], list[DreamProposal]] = {}
     order: list[tuple[str, str, str]] = []
     passthrough: list[DreamProposal] = []
     for p in proposals:
-        if p.mode != "append_text":
+        if p.mode != "append_text" or p.target_kind in ATOMIC_ENTRY_KINDS:
             passthrough.append(p)
             continue
         key = (p.target_kind, p.target_path, p.mode)

@@ -108,10 +108,14 @@ def test_validate_allows_distinct_jsonl_rows_to_same_file(tmp_path: Path) -> Non
 
 
 def test_validate_still_rejects_conflicting_append_text_same_path(tmp_path: Path) -> None:
-    """The append_text/replace_text conflict rule must survive the jsonl carve-out."""
+    """The append_text/replace_text conflict rule must survive the jsonl carve-out.
+
+    ah_1010: memory/user entries are atomic and keyed by path + text (see
+    tests/test_memory_appends_atomic.py), so the rule is pinned on a skill file,
+    where two distinct append bodies still collide."""
     def _mem(pid: str, text: str) -> DreamProposal:
         return DreamProposal(
-            id=pid, target_kind="memory", target_path="memory.md", mode="append_text",
+            id=pid, target_kind="skill", target_path="skills/x.md", mode="append_text",
             summary=pid, provenance=["sessions/1.md:1"], proposed_text=text, approved=True,
         )
     artifact = _artifact_with(_mem("m1", "- one"), tmp_path)
